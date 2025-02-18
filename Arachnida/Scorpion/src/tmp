@@ -1,0 +1,32 @@
+use std::path::PathBuf;
+
+mod metadata;
+use metadata::Metadata;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Replace with your image path
+    let path = PathBuf::from("example.jpg");
+    
+    // Get metadata
+    let metadata = Metadata::from_file(&path)?;
+    
+    // Print all metadata fields
+    println!("File Information:");
+    println!("Size: {} bytes", metadata.size_bytes);
+    if let Some(created) = metadata.created {
+        println!("Created: {}", created.format("%Y-%m-%d %H:%M:%S"));
+    }
+    
+    println!("\nImage Information:");
+    println!("Dimensions: {}x{}", metadata.width, metadata.height);
+    println!("Color Type: {}", metadata.color_type);
+    
+    println!("\nCamera Information:");
+    if let Some(model) = &metadata.camera_model {
+        println!("Camera Model: {}", model);
+    } else {
+        println!("No camera model information available");
+    }
+    
+    Ok(())
+}
