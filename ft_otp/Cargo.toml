@@ -1,0 +1,8 @@
+[package]
+name = "ft_otp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.30", features = ["derive"] }
+sha1_smol = "1.0.1"
