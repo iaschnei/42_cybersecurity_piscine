@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Write, Error};
+use std::io::{Read, Write, Error, ErrorKind};
 
 pub struct KeyStorage {
   file_path: String,
@@ -15,32 +15,40 @@ impl KeyStorage {
     }
   }
 
-  // Encrypt the data using xor of data / encrypt key
-  // Useful because you only have to run it again to decrypt but not safe for real world app
-  pub fn xor_encrypt_decrypt(&self, data: &[u8]) -> Vec<u8> {
+  /// Encrypts or decrypts data
+  /// XOR is useful here because it can be used both ways, but is unsafe in real world apps
+  fn xor_encrypt_decrypt(&self, data: &[u8]) -> Vec<u8> {
     data.iter()
       .zip(self.encryption_key.iter().cycle())
-      .map(|(a, b)| a ^ b)
+      .map(|(data_byte, key_byte)| data_byte ^ key_byte)
       .collect()
   }
 
-  pub fn store_key(&self, hexa_key: &str) -> Result<(), Error>{
+  pub fn store_key(&self, hex_key: &str) -> Result<(), Error> {
+    let key_bytes = self.hex_string_to_bytes(hex_key)?;
+    let encrypted = self.xor_encrypt_decrypt(&key_bytes);
+    
     let mut file = File::create(&self.file_path)?;
-    let encrypted = self.xor_encrypt_decrypt(hexa_key.as_bytes());
-    file.write_all(&encrypted)?;
-    Ok(())
+    file.write_all(&encrypted)
   }
 
-  pub fn read_key(&self) -> Result<String, Error> {
+  pub fn read_key(&self) -> Result<Vec<u8>, Error> {
     let mut file = File::open(&self.file_path)?;
     let mut encrypted = Vec::new();
     file.read_to_end(&mut encrypted)?;
-    let decrypted = self.xor_encrypt_decrypt(&encrypted);
-    String::from_utf8(decrypted)
-      .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))
+    
+    Ok(self.xor_encrypt_decrypt(&encrypted))
+  }
+
+  fn hex_string_to_bytes(&self, hex_string: &str) -> Result<Vec<u8>, Error> {
+    hex_string.chars()
+      .collect::<Vec<char>>()
+      .chunks(2)
+      .map(|chunk| {
+        let hex_pair: String = chunk.iter().collect();
+        u8::from_str_radix(&hex_pair, 16)
+          .map_err(|e| Error::new(ErrorKind::InvalidData, e))
+      })
+      .collect()
   }
 }
-
-// new:     Create a new storage (file) and associate a key with it : 4 digit key as arg
-// store:   Encrypt the given key using XOR with the storage key and write it in file
-// read:    Decrypt using the same XOR and return the new string

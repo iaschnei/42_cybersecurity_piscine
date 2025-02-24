@@ -1,105 +1,132 @@
 use std::{fs::File, io::Read, path::Path, time::SystemTime};
 use clap::{Parser, ArgGroup};
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
 
 mod key_storage;
 use key_storage::KeyStorage;
 
+const TOTP_PERIOD: u64 = 30;       // Time step in seconds
+const TOTP_DIGITS: usize = 6;      // Number of digits in the code
+const TOTP_MODULUS: i32 = 1000000; // 10^TOTP_DIGITS
+
+const MIN_HEX_KEY_LENGTH: usize = 64;
+const MAX_HEX_KEY_LENGTH: usize = 160;
+
 #[derive(Parser, Debug, Clone)]
-#[clap(author, version, about)]
-#[command(group(ArgGroup::new("output_path").required(true).args(["generate_path", "key_path"])))]
+#[clap(author, version, about = "ft_otp")]
+#[command(group(
+    ArgGroup::new("output_path")
+        .required(true)
+        .args(["generate_path", "key_path"])
+))]
 struct Args {
-  /// The encrypt key for the file
-  #[arg(short = 'x', long, value_parser = expect_four_digits)]
-  x: String,
+    /// The encryption key (must be exactly 4 digits)
+    #[arg(short = 'x', long, value_parser = validate_encryption_key)]
+    x: String,
 
-  /// Generate a new key file with the -x key
-  #[arg(short = 'g', long, value_name = "PATH")]
-  generate_path: Option<String>,
+    /// Path to generate a new key file using the encryption key
+    #[arg(short = 'g', long, value_name = "PATH")]
+    generate_path: Option<String>,
 
-  /// Generate a new temp code from a key file
-  #[arg(short = 'k', long, value_name = "PATH")]
-  key_path: Option<String>,
+    /// Path to an existing key file to generate a TOTP code
+    #[arg(short = 'k', long, value_name = "PATH")]
+    key_path: Option<String>,
 }
 
-const EXPIRE_TIME: u64 = 30;
-const DIGITS: i32 = 6;
+fn main() -> Result<(), std::io::Error> {
+    let args = Args::parse();
 
-fn main() -> Result<(), std::io::Error>{
-
-  let args = Args::parse();
-
-  if !args.generate_path.is_none() {
-
-    let mut hexa_key_file = File::open(&args.generate_path.clone().unwrap())?;
-    let mut hexa_key = Vec::new();
-    hexa_key_file.read_to_end(&mut hexa_key)?;
-    if hexa_key.len() < 64 || hexa_key.len() > 160 {
-      eprintln!("The key must be between 64 and 160 chars long.");
-      return Ok(());
+    match args.generate_path {
+        Some(path) => generate_new_key(&path, &args.x),
+        _none => generate_totp_code(&args.key_path.unwrap(), &args.x),
     }
+}
 
-    let hexa_key_str = String::from_utf8_lossy(&hexa_key).into_owned();
-    if !hexa_key_str.chars().all(|c| c.is_ascii_hexdigit()) {
-      eprintln!("The key can only contain hexadecimal digits");
-      return Ok(());
-    }
+fn generate_new_key(input_path: &str, encryption_key: &str) -> Result<(), std::io::Error> {
+    let hex_key = read_hex_key(input_path)?;
+    validate_hex_key(&hex_key)?;
 
-    let storage_path = Path::new(&args.generate_path.unwrap())
-      .with_extension("key")
-      .to_string_lossy()
-      .into_owned();
-    let storage = KeyStorage::new(&storage_path, &args.x);
-    storage.store_key(&hexa_key_str)?;
-    println!("Key saved successfully.");
-    return Ok(())
-  }
-  else {
-
-    let storage = KeyStorage::new(&args.key_path.unwrap(), &args.x);
-    let key = storage.read_key().unwrap().to_string();
+    let output_path = Path::new(input_path)
+        .with_extension("key")
+        .to_string_lossy()
+        .into_owned();
     
-    //"Counter" for HOTP is replaced by a time frame in TOTP protocol
-    let current_time = SystemTime::now().elapsed().expect("Couldn't get current time.").as_secs();
-    let time = current_time / EXPIRE_TIME;
+    let storage = KeyStorage::new(&output_path, encryption_key);
+    storage.store_key(&hex_key)?;
+    println!("Key saved successfully.");
+    Ok(())
+}
 
-    let code = generate_hotp(key.into(), time, DIGITS);
+fn generate_totp_code(key_path: &str, encryption_key: &str) -> Result<(), std::io::Error> {
+    let storage = KeyStorage::new(key_path, encryption_key);
+    let key = storage.read_key()?;
 
+    let current_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("System time before Unix epoch")
+        .as_secs();
+    
+    let time_counter = current_time / TOTP_PERIOD;
+    let code = generate_hotp(key, time_counter, TOTP_MODULUS);
+    
     println!("{}", code);
-    return Ok(());
-  }
+    Ok(())
 }
 
-// All of this is in RFC 4226, so no surprise here
-fn generate_hotp(secret_key: Vec<u8>, time: u64, digit: i32) -> String {
+/// Follows RFC 4226's requirements
+fn generate_hotp(secret_key: Vec<u8>, counter: u64, modulus: i32) -> String {
+    // Convert counter to big-endian byte array
+    let counter_bytes = counter.to_be_bytes();
 
-  //Generate a counter
-  let mut bytes = [0u8; 8];
+    // Generate HMAC-SHA1
+    let mut mac = Hmac::<Sha1>::new_from_slice(&secret_key)
+        .expect("HMAC can take key of any size");
+    mac.update(&counter_bytes);
+    let hmac_result = mac.finalize().into_bytes();
 
-  let mut counter = time;
-  for i in (0..8).rev() {
-    bytes[i] = (counter & 0xFF) as u8;
-    counter >>= 8;
-  }
+    // Dynamic truncation
+    let offset = (hmac_result[19] & 0x0F) as usize;
+    let truncated = ((hmac_result[offset] & 0x7F) as i32) << 24 |
+                   ((hmac_result[offset + 1] & 0xFF) as i32) << 16 |
+                   ((hmac_result[offset + 2] & 0xFF) as i32) << 8 |
+                   (hmac_result[offset + 3] & 0xFF) as i32;
 
-  let mut hmac = sha1_smol::Sha1::from(secret_key);
-  hmac.update(&bytes);
-  let res = hmac.digest().bytes();
-
-  let offset = (res.last().unwrap() & 0x0F) as usize;
-
-  let truncated = ((res[offset] & 0x7F) as i32) << 24 |
-  ((res[offset + 1] & 0xFF) as i32) << 16 |
-  ((res[offset + 2] & 0xFF) as i32) << 8 |
-  (res[offset + 3] & 0xFF) as i32;
-
-  let code = (truncated % 10 ^ digit).to_string();
-  
-  code
+    // Generate fixed-length code
+    format!("{:0width$}", truncated % modulus, width = TOTP_DIGITS)
 }
 
-fn expect_four_digits(input: &str) -> Result<String, String> {
-  if input.len() != 4 || !input.chars().all(|c| c.is_ascii_digit()) {
-    return Err("Value must be exactly 4 digits".to_string())
-  }
-  Ok(input.to_string())
+fn read_hex_key(path: &str) -> Result<String, std::io::Error> {
+    let mut file = File::open(path)?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    Ok(String::from_utf8_lossy(&content).into_owned())
+}
+
+fn validate_hex_key(key: &str) -> Result<(), std::io::Error> {
+    use std::io::{Error, ErrorKind};
+
+    if key.len() < MIN_HEX_KEY_LENGTH || key.len() > MAX_HEX_KEY_LENGTH {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Key length must be between {} and {} characters", 
+                   MIN_HEX_KEY_LENGTH, MAX_HEX_KEY_LENGTH)
+        ));
+    }
+
+    if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Key must contain only hexadecimal digits"
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_encryption_key(input: &str) -> Result<String, String> {
+    if input.len() != 4 || !input.chars().all(|c| c.is_ascii_digit()) {
+        return Err("Encryption key must be exactly 4 digits".to_string());
+    }
+    Ok(input.to_string())
 }
